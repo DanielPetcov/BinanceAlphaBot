@@ -1,10 +1,12 @@
 import asyncio
 import requests
 import os
+import json
 
 from typing import TypedDict, Any, Mapping, Sequence
 
 from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,6 +14,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_URL = os.getenv("API_URL")
 WAIT_TIME = 10  # seconds
+CHAT_FILE = "chat_ids.json"
+
 
 def fetch_list():
     resp = requests.get(API_URL)
@@ -19,6 +23,7 @@ def fetch_list():
     if data.get("success"):
         return data["data"]
     return None
+
 
 class TokenInfo(TypedDict):
     tokenId: str
@@ -28,16 +33,36 @@ class TokenInfo(TypedDict):
     onlineTge: bool
     onlineAirdrop: bool
 
+
 def _to_token_info(raw: Mapping[str, Any]) -> TokenInfo:
     return {
         "tokenId": str(raw.get("tokenId", "")),
         "name": str(raw.get("name", "")),
         "symbol": str(raw.get("symbol", "")),
-        "price": str(raw.get("price", "")),            # cast to str just in case it's numeric
+        "price": str(raw.get("price", "")),  # cast to str just in case it's numeric
         "onlineTge": bool(raw.get("onlineTge", False)),
         "onlineAirdrop": bool(raw.get("onlineAirdrop", False)),
     }
 
+
+# ---------- Chat ID persistence ----------
+
+def load_all_chat_ids() -> list[int]:
+    if not os.path.exists(CHAT_FILE):
+        return []
+    with open(CHAT_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_chat_id(chat_id: int):
+    chat_ids = load_all_chat_ids()
+    if chat_id not in chat_ids:
+        chat_ids.append(chat_id)
+        with open(CHAT_FILE, "w") as f:
+            json.dump(chat_ids, f)
+
+
+# ---------- Bot monitor ----------
 
 class MonitorClass:
     def __init__(self, bot_token: str):
@@ -48,7 +73,7 @@ class MonitorClass:
         old_ids = {t["tokenId"] for t in self.token_list}
         new_ids = {t["tokenId"] for t in tokens}
         return old_ids != new_ids
-    
+
     async def findNewToken(self, tokens: Sequence[Mapping[str, Any]]) -> list[TokenInfo]:
         if not self.token_list:
             return []
@@ -61,20 +86,23 @@ class MonitorClass:
         return new_infos
 
     async def announce_bot(self, tokenInfo: TokenInfo):
-        updates: tuple[Update, ...] = await self.bot.get_updates()
-        for update in updates:
-            chat_id = update.message.chat.id
-            if(chat_id):
-                message = (
-                    f"🚀 *New Token Listed on Binance Alpha!*\n\n"
-                    f"**Name:** {tokenInfo['name']} ({tokenInfo['symbol']})\n"
-                    f"**Token ID:** `{tokenInfo['tokenId']}`\n"
-                    f"**Price:** {tokenInfo['price']}\n"
-                    f"**TGE Live:** {'✅ Yes' if tokenInfo['onlineTge'] else '❌ No'}\n"
-                    f"**Airdrop Active:** {'🎁 Yes' if tokenInfo['onlineAirdrop'] else '—'}\n\n"
-                    f"Stay tuned for more updates!"
-                )
-                await self.bot.send_message(chat_id=chat_id, text=message)            
+        chat_ids = load_all_chat_ids()
+
+        message = (
+            f"🚀 *New Token Listed on Binance Alpha!*\n\n"
+            f"**Name:** {tokenInfo['name']} ({tokenInfo['symbol']})\n"
+            f"**Token ID:** `{tokenInfo['tokenId']}`\n"
+            f"**Price:** {tokenInfo['price']}\n"
+            f"**TGE Live:** {'✅ Yes' if tokenInfo['onlineTge'] else '❌ No'}\n"
+            f"**Airdrop Active:** {'🎁 Yes' if tokenInfo['onlineAirdrop'] else '—'}\n\n"
+            f"Stay tuned for more updates!"
+        )
+
+        for chat_id in chat_ids:
+            try:
+                await self.bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+            except Exception as e:
+                print(f"Failed to send to {chat_id}: {e}")
 
     async def start_listen(self):
         while True:
@@ -95,11 +123,26 @@ class MonitorClass:
                         else:
                             print("the same list")
                         self.token_list = tokens
-                
+
                 await asyncio.sleep(WAIT_TIME)
 
             except Exception as e:
                 print("A strange error happened:", e)
+
+
+# ---------- Telegram handlers ----------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    save_chat_id(chat_id)
+    await update.message.reply_text("👋 You are now subscribed to token updates!")
+
+
+def run_bot():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.ALL, start))  # save any chat that messages the bot
+    return app
 
 
 async def monitor_tokens():
@@ -108,4 +151,11 @@ async def monitor_tokens():
 
 
 if __name__ == "__main__":
-    asyncio.run(monitor_tokens())
+    loop = asyncio.get_event_loop()
+
+    # Run both the Telegram listener and the monitor in parallel
+    app = run_bot()
+
+    loop.create_task(app.run_polling())
+    loop.create_task(monitor_tokens())
+    loop.run_forever()
