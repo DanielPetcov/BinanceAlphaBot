@@ -150,12 +150,26 @@ async def monitor_tokens():
     await monitor_bot.start_listen()
 
 
-if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-
-    # Run both the Telegram listener and the monitor in parallel
+async def main():
+    # create Telegram app
     app = run_bot()
 
-    loop.create_task(app.run_polling())
-    loop.create_task(monitor_tokens())
-    loop.run_forever()
+    # initialize Telegram app
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    # run Binance monitor in parallel
+    monitor_task = asyncio.create_task(monitor_tokens())
+
+    try:
+        await monitor_task
+    finally:
+        # graceful shutdown
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
